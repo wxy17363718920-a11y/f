@@ -1,0 +1,2550 @@
+from pathlib import Path
+
+cwd = Path.cwd()
+if (cwd / "app.py").exists() and (cwd / "templates").exists():
+    ROOT = cwd
+else:
+    ROOT = cwd / "video-watermark-remover"
+
+TEMPLATES = ROOT / "templates"
+UPLOADS = ROOT / "uploads"
+OUTPUTS = ROOT / "outputs"
+
+REQUIREMENTS_TXT = r'''flask>=3.0.0
+certifi
+qrcode
+opencv-python
+numpy
+Pillow
+torch
+simple-lama-inpainting
+'''
+
+APP_PY = r'''import os
+
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except ImportError:
+    pass
+
+import json
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory
+
+try:
+    import qrcode
+    QR_AVAILABLE = True
+except ImportError:
+    qrcode = None
+    QR_AVAILABLE = False
+
+try:
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageOps
+    CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    np = None
+    Image = None
+    ImageOps = None
+    CV2_AVAILABLE = False
+
+try:
+    from simple_lama_inpainting import SimpleLama
+    LAMA_PKG_AVAILABLE = True
+except ImportError:
+    SimpleLama = None
+    LAMA_PKG_AVAILABLE = False
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+OUTPUT_DIR = BASE_DIR / "outputs"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+ALLOWED_MODES = {"ai_lama", "smart_removelogo", "delogo", "blur", "pixelate"}
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+
+TASKS = {}
+TASKS_LOCK = threading.Lock()
+FILE_INDEX = {}
+FILE_LOCK = threading.Lock()
+
+LAMA_MODEL = None
+LAMA_LOCK = threading.Lock()
+
+
+def get_lan_ip():
+    """获取当前局域网 IP，供手机在同一 Wi-Fi 下访问"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+def get_lama_model():
+    global LAMA_MODEL
+    if not LAMA_PKG_AVAILABLE:
+        raise RuntimeError("未安装 simple-lama-inpainting，请先执行 pip install -r requirements.txt")
+    with LAMA_LOCK:
+        if LAMA_MODEL is None:
+            LAMA_MODEL = SimpleLama()
+        return LAMA_MODEL
+
+
+def check_ffmpeg_installed():
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def cleanup_old_files(max_age_seconds=7200):
+    now = time.time()
+    for folder in (UPLOAD_DIR, OUTPUT_DIR):
+        for p in folder.iterdir():
+            if p.is_file() and (now - p.stat().st_mtime) > max_age_seconds:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+
+def parse_fps(rate_str):
+    if not rate_str or "/" not in str(rate_str):
+        return 0.0
+    try:
+        a, b = str(rate_str).split("/", 1)
+        a_f, b_f = float(a), float(b)
+        if b_f > 0:
+            return a_f / b_f
+    except ValueError:
+        pass
+    return 0.0
+
+
+def probe_image(image_path: Path):
+    if Image is None:
+        raise RuntimeError("请先安装 Pillow 依赖: pip install -r requirements.txt")
+    with Image.open(image_path) as im:
+        im = ImageOps.exif_transpose(im)
+        return {"width": im.width, "height": im.height, "duration": 0.0, "fps": 0.0}
+
+
+def probe_video(video_path: Path):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_streams",
+        "-show_format",
+        "-of", "json",
+        str(video_path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(res.stdout)
+    streams = data.get("streams") or []
+    if not streams:
+        raise ValueError("文件中未检测到视频流")
+
+    stream = streams[0]
+    width = int(stream["width"])
+    height = int(stream["height"])
+
+    rotation = 0
+    tags = stream.get("tags") or {}
+    if "rotate" in tags:
+        try:
+            rotation = int(float(tags["rotate"]))
+        except ValueError:
+            pass
+    for sd in stream.get("side_data_list") or []:
+        if "rotation" in sd:
+            try:
+                rotation = int(float(sd["rotation"]))
+            except ValueError:
+                pass
+
+    if abs(rotation) % 180 == 90:
+        width, height = height, width
+
+    duration = 0.0
+    for src in (stream.get("duration"), (data.get("format") or {}).get("duration")):
+        if src is not None:
+            try:
+                duration = float(src)
+                break
+            except ValueError:
+                pass
+
+    fps = parse_fps(stream.get("avg_frame_rate")) or parse_fps(stream.get("r_frame_rate"))
+    if fps < 1.0 or fps > 120.0:
+        fps = 30.0
+
+    return {"width": width, "height": height, "duration": duration, "fps": fps}
+
+
+def parse_time_window(item, is_image=False):
+    if is_image:
+        return None, None, None
+
+    start = item.get("start")
+    end = item.get("end")
+    has_start = start is not None and str(start).strip() != ""
+    has_end = end is not None and str(end).strip() != ""
+
+    s_val = None
+    e_val = None
+    if has_start:
+        s_val = max(0.0, float(start))
+    if has_end:
+        e_val = max(0.0, float(end))
+    if s_val is not None and e_val is not None and e_val <= s_val:
+        raise ValueError("结束时间必须大于开始时间")
+
+    enable_expr = None
+    if s_val is not None and e_val is not None:
+        enable_expr = f"between(t,{s_val:.3f},{e_val:.3f})"
+    elif s_val is not None:
+        enable_expr = f"gte(t,{s_val:.3f})"
+    elif e_val is not None:
+        enable_expr = f"lte(t,{e_val:.3f})"
+
+    return s_val, e_val, enable_expr
+
+
+def validate_items(raw_items, mode, width, height, media_type):
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValueError("请至少框选或涂抹一个水印区域")
+    if len(raw_items) > 60:
+        raise ValueError("单次最多支持 60 个选区或笔画")
+    if width < 4 or height < 4:
+        raise ValueError("媒体分辨率过小")
+
+    is_image = media_type == "image"
+    parsed = []
+    for it in raw_items:
+        itype = it.get("type", "rect")
+        s_val, e_val, enable_expr = parse_time_window(it, is_image=is_image)
+
+        if itype == "brush":
+            if (not is_image) and mode in {"delogo", "blur", "pixelate"}:
+                raise ValueError("视频的基础矩形模式不支持自由画笔，请切换「AI LaMa 精修」或「极速智能修复」模式")
+            pts = it.get("points") or []
+            if not pts:
+                continue
+            clean_pts = [[max(0.0, min(1.0, float(p[0]))), max(0.0, min(1.0, float(p[1])))] for p in pts]
+            radius_norm = max(0.002, min(0.2, float(it.get("radius_norm", 0.02))))
+            parsed.append({
+                "type": "brush",
+                "points": clean_pts,
+                "radius_norm": radius_norm,
+                "start": s_val,
+                "end": e_val,
+                "enable": enable_expr,
+            })
+        else:
+            nx = float(it["nx"])
+            ny = float(it["ny"])
+            nw = float(it["nw"])
+            nh = float(it["nh"])
+            x = int(round(nx * width))
+            y = int(round(ny * height))
+            w = int(round(nw * width))
+            h = int(round(nh * height))
+
+            if (not is_image) and mode == "delogo":
+                x = max(1, min(x, width - 3))
+                y = max(1, min(y, height - 3))
+                w = max(2, min(w, width - x - 1))
+                h = max(2, min(h, height - y - 1))
+            else:
+                x = max(0, min((x // 2) * 2, width - 2))
+                y = max(0, min((y // 2) * 2, height - 2))
+                w = max(2, min(((w + 1) // 2) * 2, ((width - x) // 2) * 2))
+                h = max(2, min(((h + 1) // 2) * 2, ((height - y) // 2) * 2))
+
+            parsed.append({
+                "type": "rect",
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "auto_mask": False if is_image else bool(it.get("auto_mask", True)),
+                "start": s_val,
+                "end": e_val,
+                "enable": enable_expr,
+            })
+
+    if not parsed:
+        raise ValueError("未检测到有效的水印选区")
+    return parsed
+
+
+def draw_brush_on_mask(mask, item, width, height):
+    radius_px = max(2, int(round(item["radius_norm"] * width)))
+    pts = [
+        (
+            int(round(p[0] * (width - 1))),
+            int(round(p[1] * (height - 1))),
+        )
+        for p in item["points"]
+    ]
+    if len(pts) == 1:
+        cv2.circle(mask, pts[0], radius_px, 255, -1)
+    elif len(pts) > 1:
+        tmp = np.zeros_like(mask)
+        for j in range(len(pts) - 1):
+            cv2.line(tmp, pts[j], pts[j + 1], 255, thickness=radius_px * 2, lineType=cv2.LINE_AA)
+        mask[tmp > 127] = 255
+
+
+def sample_crop_frames_gray(input_path: Path, x: int, y: int, w: int, h: int, t_start: float, t_end: float, num_samples: int = 18):
+    span = max(0.2, t_end - t_start)
+    timestamps = [t_start + (i + 0.5) * span / num_samples for i in range(num_samples)]
+    frames = []
+    expected = w * h
+    for ts in timestamps:
+        cmd = [
+            "ffmpeg", "-v", "error",
+            "-ss", f"{ts:.3f}",
+            "-i", str(input_path),
+            "-frames:v", "1",
+            "-vf", f"crop=w={w}:h={h}:x={x}:y={y}",
+            "-f", "rawvideo",
+            "-pix_fmt", "gray",
+            "pipe:1",
+        ]
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0 and len(res.stdout) >= expected:
+            arr = np.frombuffer(res.stdout[:expected], dtype=np.uint8).reshape((h, w))
+            frames.append(arr.astype(np.float32))
+    return frames
+
+
+def compute_static_watermark_mask(frames, w: int, h: int):
+    if len(frames) < 4:
+        return np.full((h, w), 255, dtype=np.uint8)
+
+    grads = []
+    for f in frames:
+        gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+        grads.append(np.hypot(gx, gy))
+
+    grad_stack = np.stack(grads, axis=0)
+    static_grad = np.percentile(grad_stack, 35, axis=0)
+
+    noise_floor = float(np.percentile(static_grad, 20))
+    thresh = max(18.0, noise_floor * 2.4 + 10.0)
+    edge_mask = (static_grad > thresh).astype(np.uint8) * 255
+
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, k_close)
+    dilated = cv2.dilate(closed, k_dilate, iterations=1)
+
+    ratio = float(np.count_nonzero(dilated)) / float(w * h)
+    if ratio < 0.015 or ratio > 0.85:
+        return np.full((h, w), 255, dtype=np.uint8)
+    return dilated
+
+
+def build_item_masks(input_path: Path, items, vid_w: int, vid_h: int, duration: float):
+    prepared = []
+    for it in items:
+        full_mask = np.zeros((vid_h, vid_w), dtype=np.uint8)
+        if it["type"] == "brush":
+            draw_brush_on_mask(full_mask, it, vid_w, vid_h)
+        else:
+            x, y, w, h = it["x"], it["y"], it["w"], it["h"]
+            if it["auto_mask"] and duration > 0.4:
+                t0 = it["start"] if it["start"] is not None else 0.0
+                t1 = it["end"] if it["end"] is not None else duration
+                t1 = min(duration, max(t0 + 0.2, t1))
+                frames = sample_crop_frames_gray(input_path, x, y, w, h, t0, t1)
+                sub_mask = compute_static_watermark_mask(frames, w, h)
+                full_mask[y:y + h, x:x + w] = sub_mask
+            else:
+                full_mask[y:y + h, x:x + w] = 255
+
+        if np.any(full_mask):
+            prepared.append({
+                "mask": full_mask,
+                "start": it["start"],
+                "end": it["end"],
+                "enable": it["enable"],
+            })
+    return prepared
+
+
+def compute_roi_clusters(combined_mask, width: int, height: int):
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(combined_mask, connectivity=8)
+    raw_rois = []
+    for lbl in range(1, num_labels):
+        rx = int(stats[lbl, cv2.CC_STAT_LEFT])
+        ry = int(stats[lbl, cv2.CC_STAT_TOP])
+        rw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        rh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        if rw <= 0 or rh <= 0:
+            continue
+        pad = max(48, min(140, max(rw, rh) // 2))
+        x1 = max(0, rx - pad)
+        y1 = max(0, ry - pad)
+        x2 = min(width, rx + rw + pad)
+        y2 = min(height, ry + rh + pad)
+        raw_rois.append([x1, y1, x2, y2])
+
+    merged = []
+    for box in raw_rois:
+        placed = False
+        for m in merged:
+            if not (box[2] < m[0] or box[0] > m[2] or box[3] < m[1] or box[1] > m[3]):
+                m[0] = min(m[0], box[0])
+                m[1] = min(m[1], box[1])
+                m[2] = max(m[2], box[2])
+                m[3] = max(m[3], box[3])
+                placed = True
+                break
+        if not placed:
+            merged.append(box)
+
+    changed = True
+    while changed and len(merged) > 1:
+        changed = False
+        next_merged = []
+        while merged:
+            cur = merged.pop(0)
+            i = 0
+            while i < len(merged):
+                other = merged[i]
+                if not (cur[2] < other[0] or cur[0] > other[2] or cur[3] < other[1] or cur[1] > other[3]):
+                    cur = [min(cur[0], other[0]), min(cur[1], other[1]), max(cur[2], other[2]), max(cur[3], other[3])]
+                    merged.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            next_merged.append(cur)
+        merged = next_merged
+
+    clusters = []
+    k_feather = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k_ctx = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+
+    for x1, y1, x2, y2 in merged:
+        roi_mask = combined_mask[y1:y2, x1:x2]
+        dilated = cv2.dilate(roi_mask, k_feather, iterations=1)
+        blurred = cv2.GaussianBlur(dilated, (7, 7), 0)
+        alpha_u8 = np.maximum(roi_mask, blurred)
+        alpha = (alpha_u8.astype(np.float32) / 255.0)[..., None]
+
+        ctx_dilated = cv2.dilate(roi_mask, k_ctx, iterations=1)
+        ctx_ring = (ctx_dilated > 0) & (roi_mask == 0)
+
+        clusters.append({
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "roi_mask": roi_mask,
+            "alpha": alpha,
+            "ctx_ring": ctx_ring,
+        })
+    return clusters
+
+
+def run_image_worker(task_id: str, input_path: Path, output_path: Path, items, mode: str, meta):
+    try:
+        if not CV2_AVAILABLE:
+            raise RuntimeError("缺少 opencv-python / numpy / Pillow 依赖")
+
+        with TASKS_LOCK:
+            TASKS[task_id]["stage"] = "正在读取图片并构建修复遮罩..."
+            TASKS[task_id]["progress"] = 15
+
+        with Image.open(input_path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            orig_rgb = np.array(im)
+
+        img_h, img_w = orig_rgb.shape[:2]
+        combined_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        for it in items:
+            if it["type"] == "brush":
+                draw_brush_on_mask(combined_mask, it, img_w, img_h)
+            else:
+                x, y, w, h = it["x"], it["y"], it["w"], it["h"]
+                combined_mask[y:y + h, x:x + w] = 255
+
+        if not np.any(combined_mask):
+            raise RuntimeError("未检测到有效水印遮罩")
+
+        out_rgb = orig_rgb.copy()
+
+        if mode == "ai_lama":
+            with TASKS_LOCK:
+                TASKS[task_id]["stage"] = "正在加载 LaMa AI 模型（首次需下载约 200MB 权重）..."
+                TASKS[task_id]["progress"] = 35
+            lama = get_lama_model()
+
+            with TASKS_LOCK:
+                TASKS[task_id]["stage"] = "正在用 AI 重建被遮挡画面..."
+                TASKS[task_id]["progress"] = 65
+
+            clusters = compute_roi_clusters(combined_mask, img_w, img_h)
+            for c in clusters:
+                x1, y1, x2, y2 = c["x1"], c["y1"], c["x2"], c["y2"]
+                orig_roi = out_rgb[y1:y2, x1:x2]
+                out_pil = lama(Image.fromarray(orig_roi), Image.fromarray(c["roi_mask"]))
+                repaired_roi = np.array(out_pil.convert("RGB"))
+                rh, rw = orig_roi.shape[:2]
+                if repaired_roi.shape[0] != rh or repaired_roi.shape[1] != rw:
+                    repaired_roi = cv2.resize(repaired_roi, (rw, rh), interpolation=cv2.INTER_LINEAR)
+                alpha = c["alpha"]
+                blended = (
+                    alpha * repaired_roi.astype(np.float32)
+                    + (1.0 - alpha) * orig_roi.astype(np.float32)
+                ).clip(0, 255).astype(np.uint8)
+                out_rgb[y1:y2, x1:x2] = blended
+
+        elif mode in {"smart_removelogo", "delogo"}:
+            with TASKS_LOCK:
+                TASKS[task_id]["stage"] = "正在执行图像快速修复..."
+                TASKS[task_id]["progress"] = 60
+            orig_bgr = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
+            repaired_bgr = cv2.inpaint(orig_bgr, combined_mask, 5, cv2.INPAINT_TELEA)
+            out_rgb = cv2.cvtColor(repaired_bgr, cv2.COLOR_BGR2RGB)
+
+        elif mode == "blur":
+            with TASKS_LOCK:
+                TASKS[task_id]["stage"] = "正在执行高斯模糊..."
+                TASKS[task_id]["progress"] = 60
+            blurred = cv2.GaussianBlur(orig_rgb, (39, 39), 0)
+            k_feather = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            dilated = cv2.dilate(combined_mask, k_feather, iterations=1)
+            soft = np.maximum(combined_mask, cv2.GaussianBlur(dilated, (7, 7), 0))
+            alpha = (soft.astype(np.float32) / 255.0)[..., None]
+            out_rgb = (
+                alpha * blurred.astype(np.float32) + (1.0 - alpha) * orig_rgb.astype(np.float32)
+            ).clip(0, 255).astype(np.uint8)
+
+        elif mode == "pixelate":
+            with TASKS_LOCK:
+                TASKS[task_id]["stage"] = "正在生成像素马赛克..."
+                TASKS[task_id]["progress"] = 60
+            ys, xs = np.where(combined_mask > 0)
+            mw = max(1, int(xs.max() - xs.min() + 1))
+            mh = max(1, int(ys.max() - ys.min() + 1))
+            block = max(8, min(mw, mh) // 8)
+            small_w = max(2, img_w // block)
+            small_h = max(2, img_h // block)
+            pix = cv2.resize(orig_rgb, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+            pix = cv2.resize(pix, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+            mask_bool = combined_mask > 0
+            out_rgb[mask_bool] = pix[mask_bool]
+
+        out_pil = Image.fromarray(out_rgb)
+        save_kwargs = {}
+        ext_low = output_path.suffix.lower()
+        if ext_low in {".jpg", ".jpeg"}:
+            save_kwargs = {"quality": 95, "subsampling": 0}
+        elif ext_low == ".webp":
+            save_kwargs = {"quality": 95}
+        out_pil.save(output_path, **save_kwargs)
+
+        out_name = output_path.name
+        with TASKS_LOCK:
+            TASKS[task_id]["status"] = "done"
+            TASKS[task_id]["progress"] = 100
+            TASKS[task_id]["stage"] = "图片去水印完成！"
+            TASKS[task_id]["media_type"] = "image"
+            TASKS[task_id]["output_url"] = f"/outputs/{out_name}"
+            TASKS[task_id]["download_url"] = f"/outputs/{out_name}?download=1"
+
+    except Exception as exc:
+        with TASKS_LOCK:
+            TASKS[task_id]["status"] = "error"
+            TASKS[task_id]["error"] = str(exc)
+
+
+def run_ai_lama_worker(task_id: str, input_path: Path, output_path: Path, items, meta):
+    vid_w = meta["width"]
+    vid_h = meta["height"]
+    duration = meta["duration"]
+    fps = meta["fps"]
+
+    with TASKS_LOCK:
+        TASKS[task_id]["stage"] = "正在智能识别水印精细轮廓..."
+        TASKS[task_id]["progress"] = 3
+
+    try:
+        if not CV2_AVAILABLE:
+            raise RuntimeError("缺少 opencv-python / numpy / Pillow 依赖")
+
+        prepared_items = build_item_masks(input_path, items, vid_w, vid_h, duration)
+        if not prepared_items:
+            raise RuntimeError("未生成有效的修复遮罩")
+
+        with TASKS_LOCK:
+            TASKS[task_id]["stage"] = "正在加载 LaMa AI 模型（首次使用需下载约 200MB 权重）..."
+            TASKS[task_id]["progress"] = 8
+
+        lama = get_lama_model()
+
+        total_frames = max(1, int(round(duration * fps))) if duration > 0 else 0
+        frame_bytes = vid_w * vid_h * 3
+        roi_cache = {}
+        temporal_cache = {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            enc_log_path = Path(tmpdir) / "enc.log"
+            dec_log_path = Path(tmpdir) / "dec.log"
+
+            dec_cmd = [
+                "ffmpeg", "-v", "error",
+                "-i", str(input_path),
+                "-vf", f"fps={fps:.6f}",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "pipe:1",
+            ]
+            enc_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-s", f"{vid_w}x{vid_h}",
+                "-r", f"{fps:.6f}",
+                "-i", "pipe:0",
+                "-i", str(input_path),
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-map", "0:v:0",
+                "-map", "1:a?",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                str(output_path),
+            ]
+
+            with open(dec_log_path, "w") as dlog, open(enc_log_path, "w") as elog:
+                dec_proc = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=dlog)
+                enc_proc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=elog)
+
+                frame_idx = 0
+                while True:
+                    raw = dec_proc.stdout.read(frame_bytes)
+                    if not raw or len(raw) < frame_bytes:
+                        break
+
+                    t_sec = frame_idx / fps
+                    active_indices = []
+                    for i, pi in enumerate(prepared_items):
+                        s, e = pi["start"], pi["end"]
+                        if (s is None or t_sec >= s) and (e is None or t_sec <= e):
+                            active_indices.append(i)
+
+                    if not active_indices:
+                        enc_proc.stdin.write(raw)
+                    else:
+                        active_key = tuple(active_indices)
+                        if active_key not in roi_cache:
+                            combined = np.zeros((vid_h, vid_w), dtype=np.uint8)
+                            for i in active_indices:
+                                combined = cv2.bitwise_or(combined, prepared_items[i]["mask"])
+                            roi_cache[active_key] = compute_roi_clusters(combined, vid_w, vid_h)
+
+                        clusters = roi_cache[active_key]
+                        frame = np.frombuffer(raw, dtype=np.uint8).reshape((vid_h, vid_w, 3)).copy()
+
+                        for c_idx, c in enumerate(clusters):
+                            x1, y1, x2, y2 = c["x1"], c["y1"], c["x2"], c["y2"]
+                            orig_roi = frame[y1:y2, x1:x2]
+                            cache_id = (active_key, c_idx)
+
+                            repaired_bgr = None
+                            t_entry = temporal_cache.get(cache_id)
+                            if t_entry is not None and np.any(c["ctx_ring"]):
+                                prev_roi, prev_repaired, reuse_cnt = t_entry
+                                if reuse_cnt < 15:
+                                    diff = np.abs(
+                                        orig_roi[c["ctx_ring"]].astype(np.int16)
+                                        - prev_roi[c["ctx_ring"]].astype(np.int16)
+                                    )
+                                    if float(np.mean(diff)) < 1.1:
+                                        repaired_bgr = prev_repaired
+                                        temporal_cache[cache_id] = (prev_roi, prev_repaired, reuse_cnt + 1)
+
+                            if repaired_bgr is None:
+                                roi_rgb = cv2.cvtColor(orig_roi, cv2.COLOR_BGR2RGB)
+                                out_pil = lama(Image.fromarray(roi_rgb), Image.fromarray(c["roi_mask"]))
+                                out_rgb = np.array(out_pil.convert("RGB"))
+                                rh, rw = orig_roi.shape[:2]
+                                if out_rgb.shape[0] != rh or out_rgb.shape[1] != rw:
+                                    out_rgb = cv2.resize(out_rgb, (rw, rh), interpolation=cv2.INTER_LINEAR)
+                                repaired_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+                                temporal_cache[cache_id] = (orig_roi.copy(), repaired_bgr, 0)
+
+                            alpha = c["alpha"]
+                            blended = (
+                                alpha * repaired_bgr.astype(np.float32)
+                                + (1.0 - alpha) * orig_roi.astype(np.float32)
+                            ).clip(0, 255).astype(np.uint8)
+                            frame[y1:y2, x1:x2] = blended
+
+                        enc_proc.stdin.write(frame.tobytes())
+
+                    frame_idx += 1
+                    if frame_idx % 5 == 0 or frame_idx == total_frames:
+                        pct = min(98, 10 + int((frame_idx / max(1, total_frames)) * 88)) if total_frames > 0 else 50
+                        with TASKS_LOCK:
+                            TASKS[task_id]["progress"] = pct
+                            if total_frames > 0:
+                                TASKS[task_id]["stage"] = f"正在逐帧 AI 修复 ({frame_idx}/{total_frames})..."
+                            else:
+                                TASKS[task_id]["stage"] = f"正在逐帧 AI 修复 (第 {frame_idx} 帧)..."
+
+                enc_proc.stdin.close()
+                dec_ret = dec_proc.wait()
+                enc_ret = enc_proc.wait()
+
+            if dec_ret != 0 or enc_ret != 0:
+                err_txt = ""
+                if enc_log_path.exists():
+                    err_txt = enc_log_path.read_text(errors="replace")[-400:]
+                raise RuntimeError(f"FFmpeg 编解码异常: {err_txt}")
+
+        out_name = output_path.name
+        with TASKS_LOCK:
+            TASKS[task_id]["status"] = "done"
+            TASKS[task_id]["progress"] = 100
+            TASKS[task_id]["stage"] = "AI 精修完成！"
+            TASKS[task_id]["media_type"] = "video"
+            TASKS[task_id]["output_url"] = f"/outputs/{out_name}"
+            TASKS[task_id]["download_url"] = f"/outputs/{out_name}?download=1"
+    except Exception as exc:
+        with TASKS_LOCK:
+            TASKS[task_id]["status"] = "error"
+            TASKS[task_id]["error"] = str(exc)
+
+
+def run_smart_removelogo_worker(task_id: str, input_path: Path, output_path: Path, items, meta):
+    vid_w = meta["width"]
+    vid_h = meta["height"]
+    duration = meta["duration"]
+
+    with TASKS_LOCK:
+        TASKS[task_id]["stage"] = "正在自动抠出水印精细轮廓..."
+        TASKS[task_id]["progress"] = 5
+
+    try:
+        if not CV2_AVAILABLE:
+            raise RuntimeError("缺少 opencv-python / numpy 依赖")
+
+        prepared_items = build_item_masks(input_path, items, vid_w, vid_h, duration)
+        if not prepared_items:
+            raise RuntimeError("未生成有效的修复遮罩")
+
+        grouped = {}
+        for pi in prepared_items:
+            key = pi["enable"] or "__ALL__"
+            if key not in grouped:
+                grouped[key] = np.zeros((vid_h, vid_w), dtype=np.uint8)
+            grouped[key] = cv2.bitwise_or(grouped[key], pi["mask"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_dir = Path(tmpdir)
+            filters = []
+            for idx, (en_key, mask_arr) in enumerate(grouped.items()):
+                mask_file = tmp_dir / f"mask_{idx}.png"
+                cv2.imwrite(str(mask_file), mask_arr)
+                f_str = f"removelogo=filename='{mask_file.as_posix()}'"
+                if en_key != "__ALL__":
+                    f_str += f":enable='{en_key}'"
+                filters.append(f_str)
+
+            filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-vf", ",".join(filters),
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-progress", "pipe:1",
+                "-nostats",
+                str(output_path),
+            ]
+            run_ffmpeg_subprocess(task_id, cmd, duration, output_path.name, "正在用精细轮廓引擎渲染...")
+    except Exception as exc:
+        with TASKS_LOCK:
+            TASKS[task_id]["status"] = "error"
+            TASKS[task_id]["error"] = str(exc)
+
+
+def build_basic_ffmpeg_command(input_path: Path, output_path: Path, items, mode: str):
+    base_cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+    if mode == "delogo":
+        filters = []
+        for b in items:
+            f = f"delogo=x={b['x']}:y={b['y']}:w={b['w']}:h={b['h']}"
+            if b["enable"]:
+                f += f":enable='{b['enable']}'"
+            filters.append(f)
+        filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+        cmd = base_cmd + ["-vf", ",".join(filters), "-map", "0:v:0", "-map", "0:a?"]
+    else:
+        filter_parts = []
+        prev_label = "0:v"
+        for i, b in enumerate(items):
+            x, y, w, h = b["x"], b["y"], b["w"], b["h"]
+            base_lbl = f"base{i}"
+            src_lbl = f"src{i}"
+            fx_lbl = f"fx{i}"
+            out_lbl = f"v{i}"
+            filter_parts.append(f"[{prev_label}]split=2[{base_lbl}][{src_lbl}]")
+            if mode == "blur":
+                filter_parts.append(f"[{src_lbl}]crop=w={w}:h={h}:x={x}:y={y},gblur=sigma=18[{fx_lbl}]")
+            else:
+                block = max(8, min(w, h) // 6)
+                pw = max(2, (w // block) // 2 * 2)
+                ph = max(2, (h // block) // 2 * 2)
+                filter_parts.append(
+                    f"[{src_lbl}]crop=w={w}:h={h}:x={x}:y={y},"
+                    f"scale={pw}:{ph}:flags=neighbor,scale={w}:{h}:flags=neighbor[{fx_lbl}]"
+                )
+            ov = f"[{base_lbl}][{fx_lbl}]overlay=x={x}:y={y}"
+            if b["enable"]:
+                ov += f":enable='{b['enable']}'"
+            ov += f"[{out_lbl}]"
+            filter_parts.append(ov)
+            prev_label = out_lbl
+
+        filter_parts.append(f"[{prev_label}]pad=ceil(iw/2)*2:ceil(ih/2)*2[outv]")
+        cmd = base_cmd + ["-filter_complex", ";".join(filter_parts), "-map", "[outv]", "-map", "0:a?"]
+
+    cmd += [
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats", str(output_path),
+    ]
+    return cmd
+
+
+def run_ffmpeg_subprocess(task_id: str, cmd, duration: float, output_filename: str, stage_text: str):
+    with TASKS_LOCK:
+        TASKS[task_id]["stage"] = stage_text
+
+    tail_logs = []
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    for raw_line in proc.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("out_time_us="):
+            val = line.split("=", 1)[1]
+            if val.isdigit() and duration > 0:
+                cur_sec = int(val) / 1_000_000.0
+                pct = min(99, max(5, int((cur_sec / duration) * 100)))
+                with TASKS_LOCK:
+                    TASKS[task_id]["progress"] = pct
+        elif line == "progress=end":
+            with TASKS_LOCK:
+                TASKS[task_id]["progress"] = 99
+        else:
+            tail_logs.append(line)
+            if len(tail_logs) > 25:
+                tail_logs.pop(0)
+
+    ret = proc.wait()
+    with TASKS_LOCK:
+        if ret == 0:
+            TASKS[task_id]["status"] = "done"
+            TASKS[task_id]["progress"] = 100
+            TASKS[task_id]["stage"] = "处理完成！"
+            TASKS[task_id]["media_type"] = "video"
+            TASKS[task_id]["output_url"] = f"/outputs/{output_filename}"
+            TASKS[task_id]["download_url"] = f"/outputs/{output_filename}?download=1"
+        else:
+            TASKS[task_id]["status"] = "error"
+            TASKS[task_id]["error"] = "FFmpeg 处理失败: " + " | ".join(tail_logs[-5:])
+
+
+def run_basic_worker(task_id: str, cmd, duration: float, output_filename: str):
+    try:
+        run_ffmpeg_subprocess(task_id, cmd, duration, output_filename, "正在渲染处理...")
+    except Exception as exc:
+        with TASKS_LOCK:
+            TASKS[task_id]["status"] = "error"
+            TASKS[task_id]["error"] = str(exc)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/health")
+def health():
+    port = request.host.split(":")[-1] if ":" in request.host else "8000"
+    lan_ip = get_lan_ip()
+    return jsonify({
+        "ffmpeg": bool(shutil.which("ffmpeg")),
+        "ffprobe": bool(shutil.which("ffprobe")),
+        "cv2": CV2_AVAILABLE,
+        "lama": LAMA_PKG_AVAILABLE,
+        "qr": QR_AVAILABLE,
+        "lan_url": f"http://{lan_ip}:{port}",
+    })
+
+
+@app.route("/api/lan_qr.svg")
+def lan_qr_svg():
+    port = request.host.split(":")[-1] if ":" in request.host else "8000"
+    url = f"http://{get_lan_ip()}:{port}"
+    if not QR_AVAILABLE:
+        return Response("", status=404)
+    qr = qrcode.QRCode(border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    mat = qr.get_matrix()
+    n = len(mat)
+    rects = "".join(
+        f'<rect x="{c}" y="{r}" width="1" height="1"/>'
+        for r, row in enumerate(mat)
+        for c, val in enumerate(row) if val
+    )
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {n} {n}" shape-rendering="crispEdges">'
+        f'<rect width="{n}" height="{n}" fill="#ffffff"/>'
+        f'<g fill="#000000">{rects}</g></svg>'
+    )
+    return Response(svg, mimetype="image/svg+xml")
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload_media():
+    cleanup_old_files()
+    file = request.files.get("file") or request.files.get("video")
+    if not file:
+        return jsonify({"error": "未找到上传文件"}), 400
+    if not file.filename:
+        return jsonify({"error": "文件名为空"}), 400
+
+    ext = Path(file.filename).suffix.lower()
+    if ext in ALLOWED_VIDEO_EXTENSIONS:
+        media_type = "video"
+        if not check_ffmpeg_installed():
+            return jsonify({"error": "处理视频需要安装 ffmpeg 和 ffprobe"}), 500
+    elif ext in ALLOWED_IMAGE_EXTENSIONS:
+        media_type = "image"
+    else:
+        return jsonify({"error": "不支持的格式，请上传 MP4/MOV/WebM/MKV/AVI 视频或 JPG/PNG/WebP 图片"}), 400
+
+    file_id = uuid.uuid4().hex
+    saved_name = f"{file_id}{ext}"
+    saved_path = UPLOAD_DIR / saved_name
+    file.save(saved_path)
+
+    try:
+        meta = probe_video(saved_path) if media_type == "video" else probe_image(saved_path)
+    except Exception as exc:
+        saved_path.unlink(missing_ok=True)
+        return jsonify({"error": f"解析文件信息失败: {exc}"}), 400
+
+    with FILE_LOCK:
+        FILE_INDEX[file_id] = {
+            "path": saved_path,
+            "filename": saved_name,
+            "orig_name": Path(file.filename).stem,
+            "ext": ext,
+            "media_type": media_type,
+            "width": meta["width"],
+            "height": meta["height"],
+            "duration": meta["duration"],
+            "fps": meta["fps"],
+        }
+
+    return jsonify({
+        "file_id": file_id,
+        "media_type": media_type,
+        "media_url": f"/uploads/{saved_name}",
+        "width": meta["width"],
+        "height": meta["height"],
+        "duration": meta["duration"],
+    })
+
+
+@app.route("/api/process", methods=["POST"])
+def process_media():
+    payload = request.get_json(silent=True) or {}
+    file_id = payload.get("file_id", "")
+    mode = payload.get("mode", "ai_lama")
+    raw_items = payload.get("items", [])
+
+    if mode not in ALLOWED_MODES:
+        return jsonify({"error": "无效的处理模式"}), 400
+
+    with FILE_LOCK:
+        info = FILE_INDEX.get(file_id)
+
+    if not info or not info["path"].exists():
+        return jsonify({"error": "原文件不存在或已过期，请重新上传"}), 404
+
+    media_type = info["media_type"]
+
+    if media_type == "video" and not check_ffmpeg_installed():
+        return jsonify({"error": "服务器未安装 FFmpeg"}), 500
+    if mode == "ai_lama" and (not CV2_AVAILABLE or not LAMA_PKG_AVAILABLE):
+        return jsonify({"error": "尚未安装 AI 依赖（opencv-python / simple-lama-inpainting），请先执行 pip install -r requirements.txt"}), 400
+    if not CV2_AVAILABLE and (media_type == "image" or mode == "smart_removelogo"):
+        return jsonify({"error": "尚未安装 opencv-python / Pillow，请先执行 pip install -r requirements.txt"}), 400
+
+    try:
+        items = validate_items(raw_items, mode, info["width"], info["height"], media_type)
+    except (ValueError, KeyError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    task_id = uuid.uuid4().hex
+    safe_stem = "".join(c for c in info["orig_name"] if c.isalnum() or c in "._- ") or "media"
+
+    if media_type == "image":
+        out_ext = info["ext"] if info["ext"] in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
+        output_filename = f"{safe_stem}_clean_{task_id[:8]}{out_ext}"
+    else:
+        output_filename = f"{safe_stem}_clean_{task_id[:8]}.mp4"
+
+    output_path = OUTPUT_DIR / output_filename
+
+    with TASKS_LOCK:
+        TASKS[task_id] = {
+            "status": "processing",
+            "progress": 0,
+            "stage": "任务初始化...",
+            "media_type": media_type,
+            "error": None,
+            "output_url": None,
+            "download_url": None,
+        }
+
+    if media_type == "image":
+        t = threading.Thread(
+            target=run_image_worker,
+            args=(task_id, info["path"], output_path, items, mode, info),
+            daemon=True,
+        )
+    elif mode == "ai_lama":
+        t = threading.Thread(
+            target=run_ai_lama_worker,
+            args=(task_id, info["path"], output_path, items, info),
+            daemon=True,
+        )
+    elif mode == "smart_removelogo":
+        t = threading.Thread(
+            target=run_smart_removelogo_worker,
+            args=(task_id, info["path"], output_path, items, info),
+            daemon=True,
+        )
+    else:
+        cmd = build_basic_ffmpeg_command(info["path"], output_path, items, mode)
+        t = threading.Thread(
+            target=run_basic_worker,
+            args=(task_id, cmd, info["duration"], output_filename),
+            daemon=True,
+        )
+
+    t.start()
+    return jsonify({"task_id": task_id})
+
+
+@app.route("/api/status/<task_id>")
+def get_status(task_id):
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return jsonify({"error": "任务不存在"}), 404
+        return jsonify(dict(task))
+
+
+@app.route("/uploads/<path:filename>")
+def serve_upload(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+@app.route("/outputs/<path:filename>")
+def serve_output(filename):
+    as_dl = request.args.get("download") == "1"
+    return send_from_directory(OUTPUT_DIR, filename, as_attachment=as_dl)
+
+
+if __name__ == "__main__":
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        lan_ip = get_lan_ip()
+        print(f"\n  电脑访问: http://127.0.0.1:8000")
+        print(f"  手机同一Wi-Fi访问: http://{lan_ip}:8000\n")
+    app.run(host="0.0.0.0", port=8000, debug=True)
+'''
+
+INDEX_HTML = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>CleanClip Pro - 视频 & 图片 AI 去水印</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #131823;
+      --panel-2: #1a2130;
+      --border: #273145;
+      --text: #e8eef9;
+      --muted: #8b9bb4;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --accent: #06b6d4;
+      --brush: #f43f5e;
+      --danger: #ef4444;
+      --success: #10b981;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    .container { max-width: 1320px; margin: 0 auto; padding: 18px; }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 700; }
+    .brand-badge {
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+
+    .header-right { display: flex; align-items: center; gap: 10px; }
+    .header-sub { font-size: 13px; color: var(--muted); }
+
+    .env-alert {
+      background: rgba(245, 158, 11, 0.14);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      color: #fde68a;
+      padding: 11px 15px;
+      border-radius: var(--radius);
+      margin-bottom: 14px;
+      display: none;
+      font-size: 13px;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    .dropzone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 64px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      background: rgba(255, 255, 255, 0.01);
+    }
+
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--accent);
+      background: rgba(6, 182, 212, 0.06);
+    }
+
+    .dropzone-icon { font-size: 40px; margin-bottom: 10px; }
+    .dropzone h3 { font-size: 17px; margin-bottom: 6px; }
+    .dropzone p { color: var(--muted); font-size: 13px; }
+    .dropzone-btn {
+      display: inline-block;
+      margin-top: 14px;
+      padding: 10px 18px;
+      background: var(--primary);
+      color: #fff;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .editor-area { display: none; }
+
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+      background: var(--panel-2);
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+
+    .tool-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+    .tool-btn {
+      min-height: 36px;
+      padding: 6px 11px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .tool-btn.active-rect {
+      background: rgba(6, 182, 212, 0.16);
+      border-color: var(--accent);
+      color: #67e8f9;
+    }
+
+    .tool-btn.active-brush {
+      background: rgba(244, 63, 94, 0.16);
+      border-color: var(--brush);
+      color: #fda4af;
+    }
+
+    .tool-btn.active-pan {
+      background: rgba(59, 130, 246, 0.18);
+      border-color: var(--primary);
+      color: #93c5fd;
+    }
+
+    .brush-slider-wrap {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .brush-slider-wrap input { width: 85px; accent-color: var(--brush); }
+
+    .auto-mask-toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #a5f3fc;
+      cursor: pointer;
+      user-select: none;
+      padding: 4px 2px;
+    }
+    .auto-mask-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
+
+    .stage-outer {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #06080c;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px;
+      min-height: 240px;
+      max-height: 62vh;
+      overflow: hidden;
+    }
+
+    .stage-inner {
+      position: relative;
+      display: inline-block;
+      line-height: 0;
+      max-width: 100%;
+      max-height: calc(62vh - 16px);
+    }
+
+    #previewVideo, #previewImage {
+      display: block;
+      max-width: 100%;
+      max-height: calc(62vh - 16px);
+      width: auto;
+      height: auto;
+      border-radius: 4px;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    #previewImage { display: none; }
+
+    #drawCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+      touch-action: none;
+    }
+
+    .mobile-hint {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 8px;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .transport {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+      background: var(--panel-2);
+      padding: 9px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 38px;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.18s, opacity 0.18s;
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      text-decoration: none;
+    }
+
+    .btn:hover:not(:disabled) { background: #232c3f; }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .btn-success { background: var(--success); border-color: var(--success); color: #052e16; }
+    .btn-sm { min-height: 34px; padding: 5px 10px; font-size: 12px; }
+    .btn-danger-ghost {
+      min-height: 30px;
+      background: transparent;
+      border-color: transparent;
+      color: #fca5a5;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+    .btn-danger-ghost:hover { background: rgba(239, 68, 68, 0.15); }
+
+    #seekBar { flex: 1; min-width: 80px; accent-color: var(--accent); cursor: pointer; height: 24px; }
+    .time-label {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      color: var(--muted);
+      min-width: 96px;
+      text-align: right;
+    }
+
+    .side-section { margin-bottom: 16px; }
+    .side-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .mode-group { display: grid; gap: 8px; }
+
+    .mode-option {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 10px 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+
+    .mode-option.active {
+      border-color: var(--accent);
+      background: rgba(6, 182, 212, 0.08);
+    }
+
+    .mode-option input { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--accent); }
+    .mode-option strong { display: block; font-size: 13px; }
+    .mode-option span { display: block; font-size: 12px; color: var(--muted); }
+    .tag-rec {
+      display: inline-block;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: rgba(16, 185, 129, 0.2);
+      color: #6ee7b7;
+      margin-left: 6px;
+    }
+
+    .boxes-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 240px;
+      overflow-y: auto;
+    }
+
+    .box-empty {
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      padding: 18px 10px;
+      background: var(--panel-2);
+      border-radius: 8px;
+      border: 1px dashed var(--border);
+    }
+
+    .box-item {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 12px;
+    }
+
+    .box-item-head { display: flex; justify-content: space-between; align-items: center; }
+
+    .box-tag {
+      display: inline-block;
+      background: rgba(6, 182, 212, 0.18);
+      color: #67e8f9;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 600;
+      margin-right: 6px;
+    }
+    .box-tag.brush { background: rgba(244, 63, 94, 0.18); color: #fda4af; }
+
+    .box-time-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+    .box-time-row label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 3px; }
+    .box-time-row input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 13px;
+    }
+
+    .progress-wrap {
+      display: none;
+      margin-top: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 12px;
+    }
+
+    .progress-bar-bg {
+      height: 8px;
+      background: var(--bg);
+      border-radius: 99px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      transition: width 0.25s;
+    }
+
+    .status-msg { margin-top: 10px; font-size: 13px; color: #fca5a5; display: none; }
+
+    .result-card { display: none; margin-top: 16px; }
+    .result-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    #resultVideo, #resultImage {
+      width: 100%;
+      max-height: 55vh;
+      object-fit: contain;
+      background: #000;
+      border-radius: 8px;
+    }
+    #resultImage { display: none; }
+    .save-tip { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+    /* 手机扫码弹窗 */
+    .modal-mask {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.72);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      z-index: 1000;
+    }
+    .modal-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      max-width: 360px;
+      width: 100%;
+      text-align: center;
+    }
+    .qr-box {
+      width: 190px;
+      height: 190px;
+      margin: 14px auto;
+      background: #fff;
+      border-radius: 10px;
+      padding: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .qr-box img { width: 100%; height: 100%; display: block; }
+    .lan-url-pill {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-family: ui-monospace, monospace;
+      font-size: 13px;
+      color: #67e8f9;
+      word-break: break-all;
+      margin-bottom: 12px;
+    }
+
+    @media (max-width: 980px) {
+      .workspace { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 640px) {
+      .container { padding: 10px; }
+      .card { padding: 12px; }
+      .header-sub { display: none; }
+      .dropzone { padding: 48px 16px; }
+      .stage-outer { min-height: 200px; max-height: 48vh; padding: 6px; }
+      .stage-inner, #previewVideo, #previewImage { max-height: calc(48vh - 12px); }
+      .btn { min-height: 42px; }
+      .tool-btn { min-height: 38px; padding: 6px 10px; font-size: 12px; }
+      .mode-option { padding: 9px 10px; }
+      .mode-option span { font-size: 11px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <span>CleanClip Pro</span>
+        <span class="brand-badge">视频 & 图片 AI 去水印</span>
+      </div>
+      <div class="header-right">
+        <span class="header-sub">支持手机触屏放大镜 · 局部 LaMa 重建</span>
+        <button type="button" class="btn btn-sm" id="mobileAccessBtn">📱 手机访问</button>
+      </div>
+    </header>
+
+    <div id="envAlert" class="env-alert"></div>
+
+    <div class="workspace">
+      <div class="card">
+        <input type="file" id="fileInput" accept="video/*,image/*,.mp4,.mov,.webm,.mkv,.jpg,.jpeg,.png,.webp" hidden />
+
+        <div id="dropzone" class="dropzone">
+          <div class="dropzone-icon">🎬 🖼️</div>
+          <h3>点击选择或拖拽「视频 / 图片」</h3>
+          <p>视频支持 MP4 / MOV / WebM · 图片支持 JPG / PNG / WebP</p>
+          <span class="dropzone-btn">选择相册视频或图片</span>
+          <p id="uploadProgressText" style="margin-top: 12px; color: var(--accent); font-weight: 600;"></p>
+        </div>
+
+        <div id="editorArea" class="editor-area">
+          <div class="toolbar">
+            <div class="tool-group">
+              <button type="button" class="tool-btn active-rect" id="toolRectBtn">▭ 框选</button>
+              <button type="button" class="tool-btn" id="toolBrushBtn">🖌 画笔</button>
+              <button type="button" class="tool-btn" id="toolPanBtn">🖐 滑动</button>
+              <label class="auto-mask-toggle" id="autoMaskWrap" title="自动识别视频框内静态水印文字/Logo笔画">
+                <input type="checkbox" id="autoMaskCheck" checked />
+                <span>智能抠轮廓</span>
+              </label>
+              <div class="brush-slider-wrap" id="brushSliderWrap">
+                <span>粗细</span>
+                <input type="range" id="brushSizeInput" min="6" max="50" value="18" />
+                <span id="brushSizeVal">18px</span>
+              </div>
+            </div>
+            <div class="tool-group">
+              <span id="mediaBadge" style="font-size: 12px; color: var(--muted);"></span>
+              <button type="button" class="btn btn-sm" id="undoBtn">↩ 撤销</button>
+              <button type="button" class="btn btn-sm" id="reuploadBtn">换文件</button>
+            </div>
+          </div>
+
+          <div class="stage-outer">
+            <div class="stage-inner" id="mediaStage">
+              <video id="previewVideo" preload="auto" playsinline webkit-playsinline></video>
+              <img id="previewImage" alt="预览图片" />
+              <canvas id="drawCanvas"></canvas>
+            </div>
+          </div>
+
+          <div class="mobile-hint">
+            <span id="toolHintText">💡 按住画面拖动框选水印（拖拽时会自动弹出局部放大镜）</span>
+          </div>
+
+          <div class="transport" id="transportBar">
+            <button type="button" class="btn btn-sm" id="playPauseBtn">▶ 播放</button>
+            <input type="range" id="seekBar" min="0" max="1000" value="0" />
+            <span class="time-label" id="timeLabel">00:00.0 / 00:00.0</span>
+          </div>
+        </div>
+
+        <div id="resultCard" class="result-card">
+          <div class="result-head">
+            <h3 style="font-size: 16px;">✅ 去水印完成</h3>
+            <a id="downloadBtn" class="btn btn-success" href="#" download>⬇ 下载文件</a>
+          </div>
+          <video id="resultVideo" controls playsinline webkit-playsinline></video>
+          <img id="resultImage" alt="去水印结果" />
+          <p id="saveTip" class="save-tip"></p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="side-section">
+          <div class="side-title">1. 选择去水印引擎</div>
+          <div class="mode-group">
+            <label class="mode-option active">
+              <input type="radio" name="mode" value="ai_lama" checked />
+              <div>
+                <strong>AI LaMa 精修重建<span class="tag-rec">推荐</span></strong>
+                <span>局部裁剪 + 神经网络纹理脑补（图片约 1 秒出图，视频逐帧精修）</span>
+              </div>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="smart_removelogo" />
+              <div>
+                <strong>极速智能修复</strong>
+                <span>视频自动抠轮廓极速擦除；图片快速像素修补</span>
+              </div>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="delogo" />
+              <div>
+                <strong>基础抹除 (Delogo / Inpaint)</strong>
+                <span>视频为传统矩形插值；图片为快速修补</span>
+              </div>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="blur" />
+              <div>
+                <strong>高斯模糊 (Blur)</strong>
+                <span>强力虚化实心 Logo 或隐私打码</span>
+              </div>
+            </label>
+            <label class="mode-option">
+              <input type="radio" name="mode" value="pixelate" />
+              <div>
+                <strong>像素马赛克 (Mosaic)</strong>
+                <span>经典马赛克遮挡</span>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <div class="side-section">
+          <div class="side-title">
+            <span>2. 选区与涂抹记录 (<span id="boxCount">0</span>)</span>
+            <button type="button" class="btn btn-sm" id="clearBoxesBtn">清空</button>
+          </div>
+          <div id="boxesList" class="boxes-list">
+            <div class="box-empty">请先上传视频或图片，在上方用「框选」或「画笔」标记水印</div>
+          </div>
+        </div>
+
+        <button type="button" id="processBtn" class="btn btn-primary" style="width: 100%; padding: 12px;" disabled>
+          开始去除水印
+        </button>
+
+        <div id="progressWrap" class="progress-wrap">
+          <div style="display: flex; justify-content: space-between; font-size: 13px;">
+            <span id="progressLabel">正在处理...</span>
+            <span id="progressPct">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div id="progressBarFill" class="progress-bar-fill"></div>
+          </div>
+        </div>
+
+        <div id="statusMsg" class="status-msg"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 手机扫码弹窗 -->
+  <div id="mobileModal" class="modal-mask">
+    <div class="modal-box">
+      <h3 style="font-size: 17px; margin-bottom: 6px;">📱 手机扫码打开网站</h3>
+      <p style="font-size: 12px; color: var(--muted);">确保手机和这台 Mac 连接在同一个 Wi-Fi 下</p>
+      <div class="qr-box" id="qrBox">
+        <img id="qrImg" src="" alt="手机访问二维码" />
+      </div>
+      <div class="lan-url-pill" id="lanUrlText">读取中...</div>
+      <div style="display: flex; gap: 8px; justify-content: center;">
+        <button type="button" class="btn btn-primary btn-sm" id="copyLanBtn">复制网址</button>
+        <button type="button" class="btn btn-sm" id="closeModalBtn">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById("fileInput");
+    const dropzone = document.getElementById("dropzone");
+    const uploadProgressText = document.getElementById("uploadProgressText");
+    const editorArea = document.getElementById("editorArea");
+    const previewVideo = document.getElementById("previewVideo");
+    const previewImage = document.getElementById("previewImage");
+    const transportBar = document.getElementById("transportBar");
+    const drawCanvas = document.getElementById("drawCanvas");
+    const ctx = drawCanvas.getContext("2d");
+    const brushLayer = document.createElement("canvas");
+    const brushCtx = brushLayer.getContext("2d");
+
+    const toolRectBtn = document.getElementById("toolRectBtn");
+    const toolBrushBtn = document.getElementById("toolBrushBtn");
+    const toolPanBtn = document.getElementById("toolPanBtn");
+    const toolHintText = document.getElementById("toolHintText");
+    const autoMaskWrap = document.getElementById("autoMaskWrap");
+    const autoMaskCheck = document.getElementById("autoMaskCheck");
+    const brushSliderWrap = document.getElementById("brushSliderWrap");
+    const brushSizeInput = document.getElementById("brushSizeInput");
+    const brushSizeVal = document.getElementById("brushSizeVal");
+    const undoBtn = document.getElementById("undoBtn");
+    const reuploadBtn = document.getElementById("reuploadBtn");
+    const playPauseBtn = document.getElementById("playPauseBtn");
+    const seekBar = document.getElementById("seekBar");
+    const timeLabel = document.getElementById("timeLabel");
+    const mediaBadge = document.getElementById("mediaBadge");
+    const boxesList = document.getElementById("boxesList");
+    const boxCount = document.getElementById("boxCount");
+    const clearBoxesBtn = document.getElementById("clearBoxesBtn");
+    const processBtn = document.getElementById("processBtn");
+    const progressWrap = document.getElementById("progressWrap");
+    const progressLabel = document.getElementById("progressLabel");
+    const progressPct = document.getElementById("progressPct");
+    const progressBarFill = document.getElementById("progressBarFill");
+    const statusMsg = document.getElementById("statusMsg");
+    const resultCard = document.getElementById("resultCard");
+    const resultVideo = document.getElementById("resultVideo");
+    const resultImage = document.getElementById("resultImage");
+    const downloadBtn = document.getElementById("downloadBtn");
+    const saveTip = document.getElementById("saveTip");
+    const envAlert = document.getElementById("envAlert");
+
+    const mobileAccessBtn = document.getElementById("mobileAccessBtn");
+    const mobileModal = document.getElementById("mobileModal");
+    const qrBox = document.getElementById("qrBox");
+    const qrImg = document.getElementById("qrImg");
+    const lanUrlText = document.getElementById("lanUrlText");
+    const copyLanBtn = document.getElementById("copyLanBtn");
+    const closeModalBtn = document.getElementById("closeModalBtn");
+
+    let mediaMeta = null;
+    let items = [];
+    let activeTool = "rect"; // "rect" | "brush" | "pan"
+    let brushRadiusPx = 18;
+    let isDrawing = false;
+    let startPt = null;
+    let curPt = null;
+    let currentRectDraft = null;
+    let currentBrushDraft = null;
+    let hoverPt = null;
+    let pollTimer = null;
+    let healthInfo = {};
+
+    fetch("/api/health")
+      .then((r) => r.json())
+      .then((d) => {
+        healthInfo = d;
+        const missing = [];
+        if (!d.ffmpeg || !d.ffprobe) missing.push("FFmpeg (处理视频必需)");
+        if (!d.cv2) missing.push("opencv-python / Pillow");
+        if (!d.lama) missing.push("simple-lama-inpainting / torch（如需使用 AI LaMa 引擎）");
+        if (missing.length > 0) {
+          envAlert.textContent = "环境提示：尚未检测到 " + missing.join("；");
+          envAlert.style.display = "block";
+        }
+        lanUrlText.textContent = d.lan_url || window.location.origin;
+        if (!d.qr) {
+          qrBox.innerHTML = `<span style="color:#475569;font-size:12px;padding:10px;">未安装 qrcode 库，直接复制下方网址在手机浏览器打开即可</span>`;
+        }
+      })
+      .catch(() => {});
+
+    mobileAccessBtn.addEventListener("click", () => {
+      if (healthInfo.qr !== false) {
+        qrImg.src = "/api/lan_qr.svg?t=" + Date.now();
+      }
+      mobileModal.style.display = "flex";
+    });
+    closeModalBtn.addEventListener("click", () => { mobileModal.style.display = "none"; });
+    mobileModal.addEventListener("click", (e) => { if (e.target === mobileModal) mobileModal.style.display = "none"; });
+    copyLanBtn.addEventListener("click", async () => {
+      const txt = lanUrlText.textContent;
+      try {
+        await navigator.clipboard.writeText(txt);
+        copyLanBtn.textContent = "已复制！";
+        setTimeout(() => { copyLanBtn.textContent = "复制网址"; }, 1500);
+      } catch (_) {
+        alert("请手动复制网址: " + txt);
+      }
+    });
+
+    function updateToolUI() {
+      const isImage = mediaMeta && mediaMeta.media_type === "image";
+      toolRectBtn.classList.remove("active-rect");
+      toolBrushBtn.classList.remove("active-brush");
+      toolPanBtn.classList.remove("active-pan");
+
+      if (activeTool === "rect") {
+        toolRectBtn.classList.add("active-rect");
+        autoMaskWrap.style.display = isImage ? "none" : "flex";
+        brushSliderWrap.style.display = "none";
+        drawCanvas.style.pointerEvents = "auto";
+        drawCanvas.style.touchAction = "none";
+        drawCanvas.style.cursor = "crosshair";
+        toolHintText.textContent = "💡 按住拖动框选水印（操作时会自动显示局部放大镜）";
+      } else if (activeTool === "brush") {
+        toolBrushBtn.classList.add("active-brush");
+        autoMaskWrap.style.display = "none";
+        brushSliderWrap.style.display = "flex";
+        drawCanvas.style.pointerEvents = "auto";
+        drawCanvas.style.touchAction = "none";
+        drawCanvas.style.cursor = "none";
+        toolHintText.textContent = "💡 顺着水印涂抹（需要上下滑动页面时可点「🖐 滑动」）";
+      } else {
+        toolPanBtn.classList.add("active-pan");
+        autoMaskWrap.style.display = "none";
+        brushSliderWrap.style.display = "none";
+        drawCanvas.style.pointerEvents = "none";
+        drawCanvas.style.touchAction = "auto";
+        toolHintText.textContent = "🖐 当前为浏览滑动模式，可自由上下滑页面；标记水印请切回「框选」或「画笔」";
+      }
+      redrawCanvas();
+    }
+
+    toolRectBtn.addEventListener("click", () => { activeTool = "rect"; updateToolUI(); });
+    toolBrushBtn.addEventListener("click", () => { activeTool = "brush"; updateToolUI(); });
+    toolPanBtn.addEventListener("click", () => { activeTool = "pan"; updateToolUI(); });
+
+    brushSizeInput.addEventListener("input", () => {
+      brushRadiusPx = parseInt(brushSizeInput.value, 10) || 18;
+      brushSizeVal.textContent = `${brushRadiusPx}px`;
+      redrawCanvas();
+    });
+
+    document.querySelectorAll(".mode-option input").forEach((radio) => {
+      radio.addEventListener("change", () => {
+        document.querySelectorAll(".mode-option").forEach((el) => el.classList.remove("active"));
+        radio.closest(".mode-option").classList.add("active");
+      });
+    });
+
+    function showError(msg) {
+      statusMsg.textContent = msg;
+      statusMsg.style.display = msg ? "block" : "none";
+    }
+
+    function formatTime(sec) {
+      if (!isFinite(sec) || sec < 0) sec = 0;
+      const m = Math.floor(sec / 60);
+      const s = (sec % 60).toFixed(1).padStart(4, "0");
+      return `${String(m).padStart(2, "0")}:${s}`;
+    }
+
+    function clamp(val, min, max) {
+      return Math.max(min, Math.min(max, val));
+    }
+
+    function syncCanvasSize() {
+      const rect = drawCanvas.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        drawCanvas.width = Math.round(rect.width);
+        drawCanvas.height = Math.round(rect.height);
+        brushLayer.width = drawCanvas.width;
+        brushLayer.height = drawCanvas.height;
+        redrawCanvas();
+      }
+    }
+
+    const resizeObserver = new ResizeObserver(() => syncCanvasSize());
+    resizeObserver.observe(drawCanvas);
+
+    function drawBrushStrokeOnLayer(stroke, cw, ch) {
+      if (!stroke.points || stroke.points.length === 0) return;
+      const r = Math.max(2, stroke.radius_norm * cw);
+      brushCtx.strokeStyle = "#f43f5e";
+      brushCtx.fillStyle = "#f43f5e";
+      brushCtx.lineCap = "round";
+      brushCtx.lineJoin = "round";
+      brushCtx.lineWidth = r * 2;
+
+      if (stroke.points.length === 1) {
+        brushCtx.beginPath();
+        brushCtx.arc(stroke.points[0][0] * cw, stroke.points[0][1] * ch, r, 0, Math.PI * 2);
+        brushCtx.fill();
+      } else {
+        brushCtx.beginPath();
+        brushCtx.moveTo(stroke.points[0][0] * cw, stroke.points[0][1] * ch);
+        for (let i = 1; i < stroke.points.length; i++) {
+          brushCtx.lineTo(stroke.points[i][0] * cw, stroke.points[i][1] * ch);
+        }
+        brushCtx.stroke();
+      }
+    }
+
+    function drawLoupe(cw, ch) {
+      if (!isDrawing || !curPt || !mediaMeta) return;
+      const isImage = mediaMeta.media_type === "image";
+      const mediaEl = isImage ? previewImage : previewVideo;
+      const mediaW = isImage ? mediaEl.naturalWidth : mediaEl.videoWidth;
+      const mediaH = isImage ? mediaEl.naturalHeight : mediaEl.videoHeight;
+      if (!mediaW || !mediaH) return;
+      if (!isImage && mediaEl.readyState < 2) return;
+
+      const loupeSize = Math.min(116, Math.round(Math.min(cw, ch) * 0.42));
+      if (loupeSize < 64) return;
+      const zoom = 2.2;
+      const margin = 10;
+      const lx = curPt.x < cw / 2 ? cw - loupeSize - margin : margin;
+      const ly = curPt.y < ch / 2 ? ch - loupeSize - margin : margin;
+
+      const nx = curPt.x / cw;
+      const ny = curPt.y / ch;
+      const sampleW = (loupeSize / zoom) * (mediaW / cw);
+      const sampleH = (loupeSize / zoom) * (mediaH / ch);
+
+      const srcX0 = nx * mediaW - sampleW / 2;
+      const srcY0 = ny * mediaH - sampleH / 2;
+      const srcX1 = srcX0 + sampleW;
+      const srcY1 = srcY0 + sampleH;
+
+      const csx = Math.max(0, srcX0);
+      const csy = Math.max(0, srcY0);
+      const cex = Math.min(mediaW, srcX1);
+      const cey = Math.min(mediaH, srcY1);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect ? ctx.roundRect(lx, ly, loupeSize, loupeSize, 10) : ctx.rect(lx, ly, loupeSize, loupeSize);
+      ctx.clip();
+
+      ctx.fillStyle = "#06080c";
+      ctx.fillRect(lx, ly, loupeSize, loupeSize);
+
+      try {
+        if (cex > csx && cey > csy) {
+          const dx = lx + ((csx - srcX0) / sampleW) * loupeSize;
+          const dy = ly + ((csy - srcY0) / sampleH) * loupeSize;
+          const dw = ((cex - csx) / sampleW) * loupeSize;
+          const dh = ((cey - csy) / sampleH) * loupeSize;
+          ctx.drawImage(mediaEl, csx, csy, cex - csx, cey - csy, dx, dy, dw, dh);
+        }
+      } catch (_) {}
+
+      const cx = lx + loupeSize / 2;
+      const cy = ly + loupeSize / 2;
+      if (activeTool === "brush") {
+        ctx.beginPath();
+        ctx.arc(cx, cy, brushRadiusPx * zoom, 0, Math.PI * 2);
+        ctx.strokeStyle = "#fda4af";
+        ctx.fillStyle = "rgba(244, 63, 94, 0.25)";
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = "#facc15";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(cx - 10, cy);
+        ctx.lineTo(cx + 10, cy);
+        ctx.moveTo(cx, cy - 10);
+        ctx.lineTo(cx, cy + 10);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.strokeStyle = "rgba(255,255,255,0.75)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect ? ctx.roundRect(lx, ly, loupeSize, loupeSize, 10) : ctx.rect(lx, ly, loupeSize, loupeSize);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function redrawCanvas() {
+      const cw = drawCanvas.width;
+      const ch = drawCanvas.height;
+      if (!cw || !ch) return;
+
+      ctx.clearRect(0, 0, cw, ch);
+      brushCtx.clearRect(0, 0, cw, ch);
+
+      let hasBrush = false;
+      items.forEach((it) => {
+        if (it.type === "brush") {
+          drawBrushStrokeOnLayer(it, cw, ch);
+          hasBrush = true;
+        }
+      });
+      if (currentBrushDraft) {
+        drawBrushStrokeOnLayer(currentBrushDraft, cw, ch);
+        hasBrush = true;
+      }
+      if (hasBrush) {
+        ctx.save();
+        ctx.globalAlpha = 0.5;
+        ctx.drawImage(brushLayer, 0, 0);
+        ctx.restore();
+      }
+
+      items.forEach((it, idx) => {
+        if (it.type !== "rect") return;
+        const x = it.nx * cw;
+        const y = it.ny * ch;
+        const w = it.nw * cw;
+        const h = it.nh * ch;
+
+        ctx.fillStyle = "rgba(6, 182, 212, 0.16)";
+        ctx.fillRect(x, y, w, h);
+
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#06b6d4";
+        ctx.setLineDash([]);
+        ctx.strokeRect(x, y, w, h);
+
+        const label = `#${idx + 1}${it.auto_mask ? " 智能轮廓" : ""}`;
+        ctx.font = "bold 11px sans-serif";
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = "#06b6d4";
+        ctx.fillRect(x, Math.max(0, y - 19), tw + 10, 19);
+        ctx.fillStyle = "#041218";
+        ctx.fillText(label, x + 5, Math.max(13, y - 5));
+      });
+
+      if (currentRectDraft) {
+        const x = currentRectDraft.nx * cw;
+        const y = currentRectDraft.ny * ch;
+        const w = currentRectDraft.nw * cw;
+        const h = currentRectDraft.nh * ch;
+
+        ctx.fillStyle = "rgba(250, 204, 21, 0.18)";
+        ctx.fillRect(x, y, w, h);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#facc15";
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+      }
+
+      if (activeTool === "brush" && hoverPt && !isDrawing) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(hoverPt.x, hoverPt.y, brushRadiusPx, 0, Math.PI * 2);
+        ctx.strokeStyle = "#fda4af";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      drawLoupe(cw, ch);
+    }
+
+    function renderItemsList() {
+      boxCount.textContent = items.length;
+      processBtn.disabled = !mediaMeta || items.length === 0;
+
+      if (items.length === 0) {
+        boxesList.innerHTML = `<div class="box-empty">请在上方画面中使用「框选」或「画笔」标记水印</div>`;
+        redrawCanvas();
+        return;
+      }
+
+      const isVideo = mediaMeta && mediaMeta.media_type === "video";
+      boxesList.innerHTML = "";
+
+      items.forEach((it, idx) => {
+        const itemEl = document.createElement("div");
+        itemEl.className = "box-item";
+
+        const head = document.createElement("div");
+        head.className = "box-item-head";
+
+        const left = document.createElement("div");
+        const tag = document.createElement("span");
+        tag.className = it.type === "brush" ? "box-tag brush" : "box-tag";
+        tag.textContent = it.type === "brush" ? `#${idx + 1} 画笔` : `#${idx + 1} 框选`;
+        const desc = document.createElement("span");
+        desc.style.color = "var(--muted)";
+        if (it.type === "brush") {
+          desc.textContent = `点数 ${it.points.length}`;
+        } else {
+          const pxX = Math.round(it.nx * mediaMeta.width);
+          const pxY = Math.round(it.ny * mediaMeta.height);
+          const pxW = Math.round(it.nw * mediaMeta.width);
+          const pxH = Math.round(it.nh * mediaMeta.height);
+          desc.textContent = `(${pxX},${pxY}) ${pxW}×${pxH}`;
+        }
+        left.appendChild(tag);
+        left.appendChild(desc);
+
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "btn btn-danger-ghost";
+        delBtn.textContent = "删除";
+        delBtn.onclick = () => {
+          items.splice(idx, 1);
+          renderItemsList();
+        };
+
+        head.appendChild(left);
+        head.appendChild(delBtn);
+        itemEl.appendChild(head);
+
+        if (isVideo) {
+          const timeRow = document.createElement("div");
+          timeRow.className = "box-time-row";
+
+          const startWrap = document.createElement("div");
+          const startLbl = document.createElement("label");
+          startLbl.textContent = "开始秒数 (留空=全程)";
+          const startInput = document.createElement("input");
+          startInput.type = "number";
+          startInput.step = "0.1";
+          startInput.min = "0";
+          startInput.placeholder = "例如 0.0";
+          startInput.value = it.start ?? "";
+          startInput.oninput = (e) => { it.start = e.target.value; };
+          startWrap.appendChild(startLbl);
+          startWrap.appendChild(startInput);
+
+          const endWrap = document.createElement("div");
+          const endLbl = document.createElement("label");
+          endLbl.textContent = "结束秒数 (留空=全程)";
+          const endInput = document.createElement("input");
+          endInput.type = "number";
+          endInput.step = "0.1";
+          endInput.min = "0";
+          endInput.placeholder = "例如 5.0";
+          endInput.value = it.end ?? "";
+          endInput.oninput = (e) => { it.end = e.target.value; };
+          endWrap.appendChild(endLbl);
+          endWrap.appendChild(endInput);
+
+          timeRow.appendChild(startWrap);
+          timeRow.appendChild(endWrap);
+          itemEl.appendChild(timeRow);
+        }
+
+        boxesList.appendChild(itemEl);
+      });
+
+      redrawCanvas();
+    }
+
+    drawCanvas.addEventListener("pointerdown", (e) => {
+      if (!mediaMeta || activeTool === "pan") return;
+      drawCanvas.setPointerCapture(e.pointerId);
+      const rect = drawCanvas.getBoundingClientRect();
+      const px = clamp(e.clientX - rect.left, 0, rect.width);
+      const py = clamp(e.clientY - rect.top, 0, rect.height);
+      hoverPt = { x: px, y: py };
+      curPt = { x: px, y: py };
+      isDrawing = true;
+
+      if (activeTool === "rect") {
+        startPt = { x: px, y: py };
+        currentRectDraft = null;
+      } else {
+        currentBrushDraft = {
+          type: "brush",
+          points: [[px / rect.width, py / rect.height]],
+          radius_norm: brushRadiusPx / rect.width,
+          start: "",
+          end: "",
+        };
+      }
+      redrawCanvas();
+    });
+
+    drawCanvas.addEventListener("pointermove", (e) => {
+      if (activeTool === "pan") return;
+      const rect = drawCanvas.getBoundingClientRect();
+      const curX = clamp(e.clientX - rect.left, 0, rect.width);
+      const curY = clamp(e.clientY - rect.top, 0, rect.height);
+      hoverPt = { x: curX, y: curY };
+      curPt = { x: curX, y: curY };
+
+      if (!isDrawing) {
+        if (activeTool === "brush" && e.pointerType === "mouse") redrawCanvas();
+        return;
+      }
+
+      if (activeTool === "rect" && startPt) {
+        const x = Math.min(startPt.x, curX);
+        const y = Math.min(startPt.y, curY);
+        const w = Math.abs(curX - startPt.x);
+        const h = Math.abs(curY - startPt.y);
+        currentRectDraft = {
+          type: "rect",
+          nx: x / rect.width,
+          ny: y / rect.height,
+          nw: w / rect.width,
+          nh: h / rect.height,
+          auto_mask: mediaMeta.media_type === "video" ? autoMaskCheck.checked : false,
+        };
+      } else if (activeTool === "brush" && currentBrushDraft) {
+        const nx = curX / rect.width;
+        const ny = curY / rect.height;
+        const pts = currentBrushDraft.points;
+        const last = pts[pts.length - 1];
+        const dist = Math.hypot((nx - last[0]) * rect.width, (ny - last[1]) * rect.height);
+        if (dist >= 2.5) pts.push([nx, ny]);
+      }
+      redrawCanvas();
+    });
+
+    drawCanvas.addEventListener("pointerleave", () => {
+      if (!isDrawing) {
+        hoverPt = null;
+        redrawCanvas();
+      }
+    });
+
+    function finishDrawing(e) {
+      if (!isDrawing) return;
+      isDrawing = false;
+      try { drawCanvas.releasePointerCapture(e.pointerId); } catch (_) {}
+
+      if (activeTool === "rect" && currentRectDraft) {
+        const rect = drawCanvas.getBoundingClientRect();
+        if (currentRectDraft.nw * rect.width >= 6 && currentRectDraft.nh * rect.height >= 6) {
+          items.push({ ...currentRectDraft, start: "", end: "" });
+          renderItemsList();
+        }
+      } else if (activeTool === "brush" && currentBrushDraft) {
+        items.push(currentBrushDraft);
+        renderItemsList();
+      }
+      currentRectDraft = null;
+      currentBrushDraft = null;
+      startPt = null;
+      curPt = null;
+      redrawCanvas();
+    }
+
+    drawCanvas.addEventListener("pointerup", finishDrawing);
+    drawCanvas.addEventListener("pointercancel", finishDrawing);
+
+    undoBtn.addEventListener("click", () => {
+      if (items.length > 0) {
+        items.pop();
+        renderItemsList();
+      }
+    });
+
+    clearBoxesBtn.addEventListener("click", () => {
+      items = [];
+      renderItemsList();
+    });
+
+    playPauseBtn.addEventListener("click", () => {
+      if (previewVideo.paused) previewVideo.play();
+      else previewVideo.pause();
+    });
+
+    previewVideo.addEventListener("play", () => { playPauseBtn.textContent = "⏸ 暂停"; });
+    previewVideo.addEventListener("pause", () => { playPauseBtn.textContent = "▶ 播放"; });
+
+    previewVideo.addEventListener("loadedmetadata", () => {
+      syncCanvasSize();
+      timeLabel.textContent = `${formatTime(0)} / ${formatTime(previewVideo.duration)}`;
+    });
+
+    previewImage.addEventListener("load", () => {
+      syncCanvasSize();
+    });
+
+    previewVideo.addEventListener("timeupdate", () => {
+      const dur = previewVideo.duration || 1;
+      seekBar.value = Math.round((previewVideo.currentTime / dur) * 1000);
+      timeLabel.textContent = `${formatTime(previewVideo.currentTime)} / ${formatTime(previewVideo.duration)}`;
+    });
+
+    seekBar.addEventListener("input", () => {
+      const dur = previewVideo.duration || 0;
+      previewVideo.currentTime = (seekBar.value / 1000) * dur;
+    });
+
+    dropzone.addEventListener("click", () => fileInput.click());
+    reuploadBtn.addEventListener("click", () => fileInput.click());
+
+    dropzone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      dropzone.classList.add("dragover");
+    });
+
+    dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
+
+    dropzone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropzone.classList.remove("dragover");
+      if (e.dataTransfer.files.length > 0) handleFileUpload(e.dataTransfer.files[0]);
+    });
+
+    fileInput.addEventListener("change", () => {
+      if (fileInput.files.length > 0) handleFileUpload(fileInput.files[0]);
+    });
+
+    function handleFileUpload(file) {
+      showError("");
+      resultCard.style.display = "none";
+      progressWrap.style.display = "none";
+      uploadProgressText.textContent = "正在上传并解析文件...";
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload");
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          uploadProgressText.textContent = `上传中 ${pct}%...`;
+        }
+      };
+
+      xhr.onload = () => {
+        uploadProgressText.textContent = "";
+        fileInput.value = "";
+        let res = {};
+        try { res = JSON.parse(xhr.responseText); } catch (_) {}
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          mediaMeta = res;
+          items = [];
+          activeTool = "rect";
+          dropzone.style.display = "none";
+          editorArea.style.display = "block";
+
+          const isImage = res.media_type === "image";
+          mediaBadge.textContent = `${isImage ? "图片" : "视频"} · ${res.width}×${res.height}`;
+
+          if (isImage) {
+            previewVideo.pause();
+            previewVideo.removeAttribute("src");
+            previewVideo.load();
+            previewVideo.style.display = "none";
+            transportBar.style.display = "none";
+            previewImage.style.display = "block";
+            previewImage.src = res.media_url;
+          } else {
+            previewImage.style.display = "none";
+            previewImage.removeAttribute("src");
+            previewVideo.style.display = "block";
+            transportBar.style.display = "flex";
+            previewVideo.src = res.media_url;
+          }
+
+          updateToolUI();
+          renderItemsList();
+        } else {
+          showError(res.error || "上传失败，请检查文件格式");
+        }
+      };
+
+      xhr.onerror = () => {
+        uploadProgressText.textContent = "";
+        showError("网络错误，上传失败");
+      };
+
+      xhr.send(formData);
+    }
+
+    processBtn.addEventListener("click", async () => {
+      if (!mediaMeta || items.length === 0) return;
+      showError("");
+      resultCard.style.display = "none";
+
+      const mode = document.querySelector('input[name="mode"]:checked').value;
+      processBtn.disabled = true;
+      progressWrap.style.display = "block";
+      progressLabel.textContent = "正在提交任务...";
+      progressPct.textContent = "0%";
+      progressBarFill.style.width = "0%";
+
+      try {
+        const resp = await fetch("/api/process", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file_id: mediaMeta.file_id,
+            mode,
+            items,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || "任务创建失败");
+
+        pollStatus(data.task_id);
+      } catch (err) {
+        showError(err.message);
+        progressWrap.style.display = "none";
+        processBtn.disabled = false;
+      }
+    });
+
+    function pollStatus(taskId) {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(async () => {
+        try {
+          const resp = await fetch(`/api/status/${taskId}`);
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "查询状态失败");
+
+          if (data.status === "processing") {
+            progressLabel.textContent = data.stage || "正在处理...";
+            progressPct.textContent = `${data.progress}%`;
+            progressBarFill.style.width = `${data.progress}%`;
+          } else if (data.status === "done") {
+            clearInterval(pollTimer);
+            progressPct.textContent = "100%";
+            progressBarFill.style.width = "100%";
+            progressLabel.textContent = data.stage || "处理完成！";
+            processBtn.disabled = false;
+
+            if (data.media_type === "image") {
+              resultVideo.pause();
+              resultVideo.style.display = "none";
+              resultImage.style.display = "block";
+              resultImage.src = data.output_url;
+              downloadBtn.textContent = "⬇ 下载无水印图片";
+              saveTip.textContent = "📱 手机用户提示：长按上方图片可以直接「存储到照片」；视频点下载后会保存到「文件」App。";
+            } else {
+              resultImage.style.display = "none";
+              resultVideo.style.display = "block";
+              resultVideo.src = data.output_url;
+              downloadBtn.textContent = "⬇ 下载无水印视频";
+              saveTip.textContent = "📱 手机用户提示：点击下载后会保存到手机「文件 / 下载」目录。";
+            }
+            downloadBtn.href = data.download_url;
+            resultCard.style.display = "block";
+            resultCard.scrollIntoView({ behavior: "smooth" });
+          } else if (data.status === "error") {
+            clearInterval(pollTimer);
+            progressWrap.style.display = "none";
+            processBtn.disabled = false;
+            showError(data.error || "处理失败");
+          }
+        } catch (err) {
+          clearInterval(pollTimer);
+          progressWrap.style.display = "none";
+          processBtn.disabled = false;
+          showError(err.message);
+        }
+      }, 400);
+    }
+  </script>
+</body>
+</html>
+'''
+
+
+def main():
+    TEMPLATES.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+    (ROOT / "requirements.txt").write_text(REQUIREMENTS_TXT, encoding="utf-8")
+    (ROOT / "app.py").write_text(APP_PY, encoding="utf-8")
+    (TEMPLATES / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+
+    print(f"已升级为【桌面+手机全端通用版】: {ROOT.resolve()}")
+    print("请执行:")
+    print(f"  cd {ROOT}")
+    print("  pip install -r requirements.txt")
+    print("  python app.py")
+
+
+if __name__ == "__main__":
+    main()
